@@ -1,0 +1,14 @@
+[
+  {
+    "start": 1298619,
+    "end": 1298995,
+    "originalSha256": "EA7701FB304D44CA37DA555B9EB753B275D84F82ABFFBE4142FF0804312A6FE2",
+    "replacement": "async function seedStoreBackedTaskMembership(b,Q,te){\nlet de=Q.title.trim();\nif(!Q.sessionEnded||Q.titleSource===\"default\"||!de)return;\nlet xe=b.storeSummaryMemberships.get(Q.sessionId);\nif(xe===\"admitted\"||xe===\"inFlight\")return;\nlet Ae=O(b.target,Q.sessionId),Ie={workspacePath:Ae.workspacePath,workspaceIdentity:Ae.workspaceIdentity,taskId:Ae.sessionId};\nlet Ce=!1;\nb.storeSummaryMemberships.set(Q.sessionId,\"inFlight\");\ntry{\nlet Fe=await n.getTaskMeta(Ie);\nif(xe!==\"pending\"&&Fe){b.storeSummaryMemberships.delete(Q.sessionId);return}\nawait n.seedTaskMetaIfMissing(kIe(b.target,Q));\nCe=!0;\nawait n.initializeGroupedTaskAtTop(Ie);\nlet Be=await n.getTaskMeta(Ie);\nif(!Be){b.storeSummaryMemberships.set(Q.sessionId,\"admitted\");return}\nlet Ge=n.getTaskRow(Ie);\nif(!Ge||Ge.deleted===1||Ge.archived===1||Ge.pinned===1){b.storeSummaryMemberships.set(Q.sessionId,\"admitted\");return}\nlet De=vIe(Q);\nM(L(Ae),Be,\"task_created\",De?{unreadSignal:De}:void 0);\nb.storeSummaryMemberships.set(Q.sessionId,\"admitted\");\n}catch(Be){\nif(b.storeSummaryMemberships.get(Q.sessionId)===\"inFlight\"){if(Ce||xe===\"pending\")b.storeSummaryMemberships.set(Q.sessionId,\"pending\");else b.storeSummaryMemberships.delete(Q.sessionId)}\nVn.warn(void 0,\"store-backed sessions-index membership sync failed reason=\"+te+\" taskId=\"+Ae.sessionId,Be);\n}\n}\nfunction X(b,Q,te,de){if(b.summaries.set(te.sessionId,te),te.phase===\"draft\")return;let Ae=O(b.target,te.sessionId),Ie=Q===void 0||Q.phase===\"draft\";if(Q!==void 0&&!S2(Q.phase)&&S2(te.phase)){Y(Ae,te,{moveGroupedTaskToTop:Ie});if(te.sessionEnded)void seedStoreBackedTaskMembership(b,te,\"session.terminalTransition\");return}if(Ie){F(Ae,\"session.became-visible\",{moveGroupedTaskToTop:!0});if(te.sessionEnded)void seedStoreBackedTaskMembership(b,te,\"session.became-visible\");return}let mt=te.title.trim();mt&&(Q===void 0||Q.title!==te.title)&&re(Ae,mt);te.sessionEnded&&te.titleSource!==\"default\"&&mt&&void seedStoreBackedTaskMembership(b,te,\"session.summaryUpdated\")}"
+  },
+  {
+    "start": 1314486,
+    "end": 1314486,
+    "originalSha256": "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+    "replacement": "storeSummaryMemberships:new Map,"
+  }
+]

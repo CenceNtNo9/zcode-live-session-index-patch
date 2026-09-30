@@ -1,0 +1,1448 @@
+diff --git a/apps/zcode-cli/packages/adapters/src/storage/session-store/sqlite-external-session-index-watcher.ts b/apps/zcode-cli/packages/adapters/src/storage/session-store/sqlite-external-session-index-watcher.ts
+new file mode 100644
+index 0000000..c1745de
+--- /dev/null
++++ b/apps/zcode-cli/packages/adapters/src/storage/session-store/sqlite-external-session-index-watcher.ts
+@@ -0,0 +1,195 @@
++import { watch, type FSWatcher } from "node:fs";
++import { basename, dirname, resolve } from "node:path";
++
++type InvalidationListener = {
++  onError?: (error: unknown) => void;
++  onInvalidate: () => void;
++};
++
++/**
++ * Turns cross-connection SQLite commits into advisory invalidations. SQLite remains the only
++ * source of truth: data_version is checked on the store's existing connection. Filesystem events
++ * are a low-latency hint; an active listener also gets a bounded one-second version check because
++ * Windows does not reliably report writes to an already-open WAL through fs.watch.
++ */
++export class SqliteExternalSessionIndexWatcher {
++  private readonly listeners = new Map<number, InvalidationListener>();
++  private readonly databasePath: string | null;
++  private readonly databaseName: string | null;
++  private nextListenerId = 0;
++  private watcher: FSWatcher | null = null;
++  private debounceTimer: ReturnType<typeof setTimeout> | null = null;
++  private versionCheckTimer: ReturnType<typeof setInterval> | null = null;
++  private lastDataVersion: number | null = null;
++  private disposed = false;
++
++  constructor(
++    dbPath: string,
++    private readonly readDataVersion: () => number,
++    private readonly debounceMs = 30,
++    private readonly pollIntervalMs = 1_000,
++  ) {
++    if (!Number.isFinite(debounceMs) || debounceMs < 0) {
++      throw new Error("SQLite session index watcher debounce must be non-negative");
++    }
++    if (!Number.isFinite(pollIntervalMs) || pollIntervalMs < 100 || pollIntervalMs > 10_000) {
++      throw new Error("SQLite session index watcher interval must be between 100 and 10000 ms");
++    }
++    this.databasePath = dbPath === ":memory:" ? null : resolve(dbPath);
++    this.databaseName = this.databasePath ? basename(this.databasePath) : null;
++  }
++
++  subscribe(onInvalidate: () => void, onError?: (error: unknown) => void): () => void {
++    if (this.disposed) throw new Error("SQLite session index watcher is disposed");
++    const id = this.nextListenerId++;
++    this.listeners.set(id, { onInvalidate, onError });
++    this.startWatching();
++
++    let unsubscribed = false;
++    return () => {
++      if (unsubscribed) return;
++      unsubscribed = true;
++      this.listeners.delete(id);
++      if (this.listeners.size === 0) this.stopWatching();
++    };
++  }
++
++  dispose(): void {
++    if (this.disposed) return;
++    this.disposed = true;
++    this.stopWatching();
++    this.listeners.clear();
++  }
++
++  private startWatching(): void {
++    const databasePath = this.databasePath;
++    if (!databasePath || this.disposed || this.listeners.size === 0) return;
++    if (!this.watcher) {
++      try {
++        const watcher = watch(dirname(databasePath), { persistent: false }, (_event, fileName) => {
++          if (this.isDatabaseFileEvent(fileName)) this.scheduleDataVersionCheck();
++        });
++        this.watcher = watcher;
++        watcher.on("error", (error) => this.handleWatcherError(watcher, error));
++      } catch (error) {
++        // The version check remains authoritative when this platform cannot create fs.watch.
++        this.reportError(error);
++      }
++    }
++    // Establish the connection-local baseline synchronously in subscribe(), before the gateway
++    // sends its initial index snapshot. The timer below only runs while a listener is registered.
++    if (this.lastDataVersion === null) {
++      try {
++        this.lastDataVersion = this.readDataVersion();
++      } catch (error) {
++        if (!this.isTransientBusyError(error)) this.reportError(error);
++      }
++    }
++    this.startVersionChecks();
++  }
++
++  private isDatabaseFileEvent(fileName: string | Buffer | null): boolean {
++    // Some platforms omit the changed name; a version check remains safe and inexpensive.
++    if (fileName === null) return true;
++    const changedName = fileName.toString();
++    const databaseName = this.databaseName;
++    if (!databaseName) return false;
++    const lowerChangedName = changedName.toLowerCase();
++    const lowerDatabaseName = databaseName.toLowerCase();
++    return (
++      lowerChangedName === lowerDatabaseName ||
++      lowerChangedName === `${lowerDatabaseName}-wal` ||
++      lowerChangedName === `${lowerDatabaseName}-shm` ||
++      lowerChangedName === `${lowerDatabaseName}-journal`
++    );
++  }
++
++  private startVersionChecks(): void {
++    if (
++      this.versionCheckTimer ||
++      !this.databasePath ||
++      this.disposed ||
++      this.listeners.size === 0
++    ) {
++      return;
++    }
++    this.versionCheckTimer = setInterval(() => this.checkDataVersion(), this.pollIntervalMs);
++    this.versionCheckTimer.unref();
++  }
++
++  private scheduleDataVersionCheck(): void {
++    if (this.debounceTimer) clearTimeout(this.debounceTimer);
++    this.debounceTimer = setTimeout(() => {
++      this.debounceTimer = null;
++      this.checkDataVersion();
++    }, this.debounceMs);
++    this.debounceTimer.unref();
++  }
++
++  private checkDataVersion(): void {
++    if (this.disposed || this.listeners.size === 0) return;
++    try {
++      const nextDataVersion = this.readDataVersion();
++      const previousDataVersion = this.lastDataVersion;
++      this.lastDataVersion = nextDataVersion;
++      if (previousDataVersion === null || previousDataVersion !== nextDataVersion) {
++        this.notifyInvalidation();
++      }
++    } catch (error) {
++      if (this.isTransientBusyError(error)) return;
++      this.reportError(error);
++    }
++  }
++
++  private isTransientBusyError(error: unknown): boolean {
++    if (!error || typeof error !== "object") return false;
++    const value = error as NodeJS.ErrnoException & { errcode?: number };
++    if (
++      value.code === "SQLITE_BUSY" ||
++      value.code === "SQLITE_LOCKED" ||
++      value.errcode === 5 ||
++      value.errcode === 6
++    ) {
++      return true;
++    }
++    return /\b(busy|locked)\b/i.test(value.message ?? "");
++  }
++
++  private handleWatcherError(watcher: FSWatcher, error: unknown): void {
++    if (this.watcher !== watcher) return;
++    this.watcher = null;
++    watcher.close();
++    // The data_version timer stays active as the reliable fallback.
++    if (!this.isTransientBusyError(error)) this.reportError(error);
++  }
++
++  private stopWatching(): void {
++    if (this.debounceTimer) clearTimeout(this.debounceTimer);
++    this.debounceTimer = null;
++    if (this.versionCheckTimer) clearInterval(this.versionCheckTimer);
++    this.versionCheckTimer = null;
++    this.watcher?.close();
++    this.watcher = null;
++    this.lastDataVersion = null;
++  }
++
++  private notifyInvalidation(): void {
++    for (const listener of this.listeners.values()) {
++      try {
++        listener.onInvalidate();
++      } catch (error) {
++        listener.onError?.(error);
++      }
++    }
++  }
++
++  private reportError(error: unknown): void {
++    for (const listener of this.listeners.values()) {
++      try {
++        listener.onError?.(error);
++      } catch {
++        // A diagnostic callback cannot prevent other listeners from being notified.
++      }
++    }
++  }
++}
+diff --git a/apps/zcode-cli/packages/adapters/src/storage/session-store/sqlite-session-store.ts b/apps/zcode-cli/packages/adapters/src/storage/session-store/sqlite-session-store.ts
+index 1f413ad..b7eec02 100644
+--- a/apps/zcode-cli/packages/adapters/src/storage/session-store/sqlite-session-store.ts
++++ b/apps/zcode-cli/packages/adapters/src/storage/session-store/sqlite-session-store.ts
+@@ -90,0 +91 @@ import { ensureParentDir, getDefaultSessionDbPath } from "./paths.js";
++import { SqliteExternalSessionIndexWatcher } from "./sqlite-external-session-index-watcher.js";
+@@ -236,0 +238 @@ export class SqliteSessionStore
++  private externalSessionIndexWatcher?: SqliteExternalSessionIndexWatcher;
+@@ -296,0 +299,2 @@ export class SqliteSessionStore
++    this.externalSessionIndexWatcher?.dispose();
++    this.externalSessionIndexWatcher = undefined;
+@@ -299,0 +304,22 @@ export class SqliteSessionStore
++  subscribeExternalSessionIndexInvalidation(
++    onInvalidate: () => void,
++    onError?: (error: unknown) => void,
++  ): () => void {
++    this.externalSessionIndexWatcher ??= new SqliteExternalSessionIndexWatcher(
++      this.dbPath,
++      () => this.readDataVersion(),
++    );
++    return this.externalSessionIndexWatcher.subscribe(onInvalidate, onError);
++  }
++
++  private readDataVersion(): number {
++    const result = this.db.prepare("PRAGMA data_version").get() as
++      | { data_version?: unknown }
++      | undefined;
++    const dataVersion = Number(result?.data_version);
++    if (!Number.isSafeInteger(dataVersion) || dataVersion < 0) {
++      throw new Error(`SQLite returned an invalid data_version for ${this.dbPath}`);
++    }
++    return dataVersion;
++  }
++
+diff --git a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/sessions-index-projection.ts b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/sessions-index-projection.ts
+index 15b872f..fb2168a 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/sessions-index-projection.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/sessions-index-projection.ts
+@@ -132,0 +133 @@ export class SessionsIndexProjection {
++  private readonly liveSessionIds = new Set<string>();
+@@ -147,0 +149 @@ export class SessionsIndexProjection {
++    this.liveSessionIds.add(summary.sessionId);
+@@ -195,0 +198 @@ export class SessionsIndexProjection {
++    if (this.liveSessionIds.has(summary.sessionId)) return;
+@@ -208,0 +212,13 @@ export class SessionsIndexProjection {
++  /** Refresh persisted metadata for store-only rows; a live conversation remains authoritative. */
++  refreshStoredSummary(summary: SessionSummary): SessionsIndexDelta[] {
++    if (this.liveSessionIds.has(summary.sessionId)) return [];
++    const previous = this.summaries.get(summary.sessionId);
++    if (!previous) {
++      this.summaries.set(summary.sessionId, summary);
++      return [{ op: "session.upserted", session: summary }];
++    }
++    if (summariesEqual(previous, summary)) return [];
++    this.summaries.set(summary.sessionId, summary);
++    return [{ op: "session.upserted", session: summary }];
++  }
++
+@@ -211,0 +228 @@ export class SessionsIndexProjection {
++    this.liveSessionIds.delete(sessionId);
+diff --git a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/sessions-index-publisher.ts b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/sessions-index-publisher.ts
+index db2ff24..843accf 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/sessions-index-publisher.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/sessions-index-publisher.ts
+@@ -74,0 +75,9 @@ export class SessionsIndexPublisher {
++    );
++  }
++
++  /** Refresh persisted metadata on store-only rows while retaining live conversation authority. */
++  refreshStoredSummaries(
++    summaries: readonly Parameters<SessionsIndexProjection["seed"]>[0][],
++  ): boolean {
++    return this.record(
++      summaries.flatMap((summary) => this.projection.refreshStoredSummary(summary)),
+diff --git a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/v4-gateway.ts b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/v4-gateway.ts
+index 6585dbd..43fb418 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/v4-gateway.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/v4-gateway.ts
+@@ -278,0 +279,8 @@ export interface V4GatewayHost {
++  /**
++   * Store-wide advisory invalidation for persisted session-index metadata. The gateway re-reads
++   * each active workspace through getStoredSessionSummaries; no row data crosses this callback.
++   */
++  subscribeStoredSessionChanges?(
++    onChange: () => void,
++    onError?: (error: unknown) => void,
++  ): () => void;
+@@ -625,0 +634,2 @@ export class ConversationV4Gateway {
++  private unsubscribeStoredSessionChanges?: () => void;
++  private storedSessionChangeGeneration = 0;
+@@ -1205,0 +1216 @@ export class ConversationV4Gateway {
++    this.ensureStoredSessionChangeSubscription();
+@@ -1240 +1251,2 @@ export class ConversationV4Gateway {
+-    const stored = refreshed ?? (await this.host.getStoredSessionSummaries?.(workspaceId)) ?? [];
++    const stored =
++      refreshed ?? (await this.loadStoredSessionSummariesUntilStable(workspaceId));
+@@ -1257,0 +1270,44 @@ export class ConversationV4Gateway {
++  private ensureStoredSessionChangeSubscription(): void {
++    if (this.unsubscribeStoredSessionChanges || !this.host.subscribeStoredSessionChanges) return;
++    try {
++      this.unsubscribeStoredSessionChanges = this.host.subscribeStoredSessionChanges(
++        () => this.handleStoredSessionChange(),
++        (error) => this.host.onError?.("v4.sessionsIndex.storeWatch", error),
++      );
++    } catch (error) {
++      this.host.onError?.("v4.sessionsIndex.storeWatch", error);
++    }
++  }
++
++  private async loadStoredSessionSummariesUntilStable(
++    workspaceId: string,
++  ): Promise<SessionSummary[]> {
++    let observedGeneration = this.storedSessionChangeGeneration;
++    while (!this.disposed) {
++      const summaries = (await this.host.getStoredSessionSummaries?.(workspaceId)) ?? [];
++      const currentGeneration = this.storedSessionChangeGeneration;
++      if (observedGeneration === currentGeneration) return summaries;
++      observedGeneration = currentGeneration;
++    }
++    return [];
++  }
++
++  private handleStoredSessionChange(): void {
++    if (this.disposed) return;
++    this.storedSessionChangeGeneration += 1;
++    for (const workspaceId of this.indexPublishers.keys()) {
++      void this.indexPublishers
++        .runExclusive(workspaceId, async () => {
++          const publisher = this.indexPublishers.get(workspaceId);
++          if (!publisher) throw new Error(`Missing sessions-index publisher: ${workspaceId}`);
++          const summaries = (await this.host.getStoredSessionSummaries?.(workspaceId)) ?? [];
++          if (this.disposed) return publisher;
++          if (publisher.refreshStoredSummaries(summaries)) this.flushIndex(workspaceId);
++          return publisher;
++        })
++        .catch((error: unknown) => {
++          this.host.onError?.("v4.sessionsIndex.externalRefresh", error, { workspaceId });
++        });
++    }
++  }
++
+@@ -2840,0 +2897,2 @@ export class ConversationV4Gateway {
++    this.unsubscribeStoredSessionChanges?.();
++    this.unsubscribeStoredSessionChanges = undefined;
+diff --git a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/v4-bridge.ts b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/v4-bridge.ts
+index 20e6488..71e3d3e 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/v4-bridge.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/v4-bridge.ts
+@@ -1568,0 +1569,3 @@ export function createConversationV4Gateway(
++    subscribeStoredSessionChanges: (onChange, onError) =>
++      context.deps.sessionStore?.subscribeExternalSessionIndexInvalidation?.(onChange, onError) ??
++      (() => undefined),
+diff --git a/apps/zcode-cli/packages/contracts/src/interfaces/session-store.port.ts b/apps/zcode-cli/packages/contracts/src/interfaces/session-store.port.ts
+index 40155f3..d213be6 100644
+--- a/apps/zcode-cli/packages/contracts/src/interfaces/session-store.port.ts
++++ b/apps/zcode-cli/packages/contracts/src/interfaces/session-store.port.ts
+@@ -1089,0 +1090,9 @@ export interface SessionStorePort {
++  /**
++   * Subscribe to advisory notifications that another SQLite connection may have changed
++   * persisted session metadata. The callback carries no session data; consumers must re-read
++   * through their existing workspace-scoped store query. Returns an idempotent unsubscribe.
++   */
++  subscribeExternalSessionIndexInvalidation?(
++    onInvalidate: () => void,
++    onError?: (error: unknown) => void,
++  ): () => void;
+diff --git a/apps/zcode-cli/specs/sessions-index-external-invalidation.md b/apps/zcode-cli/specs/sessions-index-external-invalidation.md
+new file mode 100644
+index 0000000..e7b7214
+--- /dev/null
++++ b/apps/zcode-cli/specs/sessions-index-external-invalidation.md
+@@ -0,0 +1,42 @@
++# Live sessions-index updates after external SQLite commits
++
++## Goal
++
++A running V4 Host that already has a `sessions-index/<workspaceId>` subscriber must publish a newly persisted session from another CLI runtime without restarting. The change travels through the existing workspace-scoped V4 publisher and its existing delivery path.
++
++## State owner and interfaces
++
++- `SqliteSessionStore` and the existing SQLite database remain the sole authority for persisted session metadata. No mirror database, table, sidecar journal, or serialized summary cache is added.
++- The store port exposes an optional invalidation subscription. The signal contains no session data; consumers must re-read through the existing workspace-scoped `getStoredSessionSummaries(workspaceId)` host hook.
++- The SQLite adapter watches its existing database directory for main database and SQLite sidecar events as a low-latency hint. Because Windows `fs.watch` does not reliably report updates to an already-open WAL, an active listener also checks `PRAGMA data_version` on the same open connection every second. The connection-local baseline is read synchronously before the initial index snapshot. Own-connection writes and duplicate/false-positive notifications do not emit an invalidation. A short event-driven debounce coalesces a write burst. The interval exists only while at least one external invalidation listener is subscribed, is unreferenced, and is cleared on final unsubscribe/dispose.
++- The gateway remains the owner of the sessions-index projection, sequence, log epoch, replay buffer and flush scheduling. Store invalidation refreshes store-only summaries through the existing `SessionsIndexPublisher` and uses `flushIndex` for delivery. A row already advanced from a live conversation remains owned by that live projection.
++
++## Event order
++
++1. On the first index subscription, the gateway attaches the store invalidation listener before awaiting the initial summary seed.
++2. The store seed is filtered by the requested workspace identity/path using the existing host hook. Live runtime projections continue to override persisted seed rows.
++3. A second runtime commits a placeholder session through `SessionStorePort.createSession` to the same SQLite database.
++4. The first runtime receives a filesystem wakeup or its next active `data_version` check. A changed version emits one invalidation callback; the workspace-scoped store read inserts the placeholder summary. The periodic fallback bounds response to about one second when a filesystem event is missed.
++5. The writer commits first-input title metadata through `SessionStorePort.updateSession`. A later invalidation rereads that workspace and refreshes the existing store-only summary, producing one upsert for the changed title.
++6. Replaying metadata that changes the stored row but not `SessionSummary` causes one invalidation, while an equal summary produces no additional logical delta. A publisher row already advanced from a live conversation is never replaced by the store refresh.
++7. The gateway serializes each fresh workspace-scoped read with the existing per-workspace publisher lock and uses `flushIndex` to deliver changes to current subscribers.
++8. On gateway disposal the invalidation listener is removed; on store close the SQLite watcher, active version interval and pending debounce timer are closed.
++
++## Isolation and delivery invariants
++
++- A store-wide notification is not a workspace membership claim. The gateway re-reads each active index through the existing workspace filter, so sessions for other workspace identities or paths are never inserted into the current topic.
++- The gateway does not take or change session owner/lease state and does not attach a second Desktop Host.
++- Desktop continuous delivery, mobile replay/resume and stale-run protection remain owned by the existing publisher and transport paths; the change does not bypass them.
++- Repeated notifications for the same SQLite version are ignored. Re-reading an unchanged store-only summary is idempotent; changed persisted metadata refreshes store-only rows, while live rows are not overwritten.
++
++## Failure behavior and persistence boundary
++
++- If the platform cannot create the directory watcher, the host reports the error and continues with the active `data_version` fallback. If `data_version` reads encounter transient SQLite busy/locked errors, that check is skipped and the next active tick retries without advancing the baseline. Other runtime errors are reported.
++- Runtime watcher errors are reported through the provided error callback. The store remains authoritative and a later index subscription can retry watcher setup.
++- No schema migration is required. Current supported writers use SQLite transactions (WAL in the normal file-backed configuration); replacing an open database file externally is outside this prototype. In-memory databases do not provide cross-process notifications.
++
++## Provider-free acceptance
++
++Use two independent Node processes and one unique temporary SQLite database. Runtime A opens the store, synchronously establishes the watcher baseline, subscribes its actual `ConversationV4Gateway` to workspace A, proves it remains alive, then stays alive while B starts. Runtime B opens its own store and calls the supported `createSession` API first for workspace B and then for workspace A with a default placeholder title. A must emit no delta for B. For A, first observe one placeholder upsert, then call the supported `updateSession` API with synthetic first-input title metadata; A must publish one title-correction upsert without restart. A metadata-only commit must be detected by the active `data_version` check but produce no additional summary delta. A compiled `SessionsIndexProjection` check also proves store refresh cannot replace an already-ingested local live title or phase. No provider is called. All session IDs, titles, project IDs and workspace paths are synthetic.
++
++This does not verify the rendered Desktop UI or a packaged ZCode installation.
+diff --git a/packages/services/src/zcode-agent/zcodeTaskIndexSyncer.ts b/packages/services/src/zcode-agent/zcodeTaskIndexSyncer.ts
+index 29fdca8..45fe546 100644
+--- a/packages/services/src/zcode-agent/zcodeTaskIndexSyncer.ts
++++ b/packages/services/src/zcode-agent/zcodeTaskIndexSyncer.ts
+@@ -269,0 +270,2 @@ interface WorkspaceIngestState {
++  /** 当前 runtime 中来自持久 store 的在线摘要已处理 membership 的幂等闸门。 */
++  storeSummaryMemberships: Map<string, "inFlight" | "pending" | "admitted">;
+@@ -626,2 +628,67 @@ export function createZCodeTaskIndexSyncer(
+-  /** 标题变化 → sqlite title patch；行缺失回源完整 snapshot（对齐旧 first_input 语义）。 */
+-  function applyTitleChange(target: ZCodeAgentSessionTarget, title: string): void {
++  /**
++   * 持久 sessionStore 摘要没有 Desktop runtime 的 SessionRecord，不能用 readSession(existing-only)
++   * 反向恢复另一个进程的生命周期。接收端摘要以 sessionEnded=true 标记非活跃 record；
++   * summary title 已可见后，用现有 baseline 转换和 TaskIndexRepo insert-if-missing 建立 membership。
++   */
++  async function seedStoreBackedTaskMembership(
++    state: WorkspaceIngestState,
++    summary: SessionSummary,
++    reason: string,
++  ): Promise<void> {
++    const title = summary.title.trim();
++    if (!summary.sessionEnded || summary.titleSource === "default" || !title) return;
++    const membership = state.storeSummaryMemberships.get(summary.sessionId);
++    if (membership === "inFlight" || membership === "admitted") return;
++    state.storeSummaryMemberships.set(summary.sessionId, "inFlight");
++    let seeded = membership === "pending";
++    const target = sessionTargetFrom(state.target, summary.sessionId);
++    try {
++      const existing = await taskIndexRepo.getTaskMeta({
++        workspacePath: target.workspacePath,
++        workspaceIdentity: target.workspaceIdentity,
++        taskId: target.sessionId,
++      });
++      if (existing && !seeded) {
++        state.storeSummaryMemberships.set(summary.sessionId, "admitted");
++        return;
++      }
++      if (!seeded) {
++        const baseline = buildBaselineMetaFromSummary(state.target, summary);
++        await taskIndexRepo.seedTaskMetaIfMissing(baseline);
++        seeded = true;
++      }
++      // 只初始化尚无顺序记录的分组位置；不得把 seed 返回的旧整行写回。
++      // 本地创建/编辑可能在 insert-if-missing 后、分组 admission 前完成，排序入口
++      // 会重新读取现行 tombstone 状态，而不会覆写 status/model/mode 等本地字段。
++      const taskIndexTarget = {
++        workspacePath: target.workspacePath,
++        workspaceIdentity: target.workspaceIdentity,
++        taskId: target.sessionId,
++      };
++      await taskIndexRepo.initializeGroupedTaskAtTop(taskIndexTarget);
++      // insert-if-missing 保留已删除行；getTaskMeta 对 tombstone 返回 null，不能复活或广播。
++      const meta = await taskIndexRepo.getTaskMeta(taskIndexTarget);
++      // Public repo APIs enforce eligibility and expose only live metadata; never inspect private rows.
++      if (meta) emitWorkspaceTaskListChanged(broadcastTargetFrom(target), meta, "task_created");
++      state.storeSummaryMemberships.set(summary.sessionId, "admitted");
++    } catch (error) {
++      if (seeded) state.storeSummaryMemberships.set(summary.sessionId, "pending");
++      else state.storeSummaryMemberships.delete(summary.sessionId);
++      logger.warn(
++        undefined,
++        "同步 store-backed sessions-index membership 失败 reason=" +
++          reason +
++          " taskId=" +
++          target.sessionId,
++        error,
++      );
++    }
++  }
++
++  /** 标题变化 → sqlite title patch；缺行时按 store/runtime 来源建立 task-index membership。 */
++  function applyTitleChange(
++    state: WorkspaceIngestState,
++    target: ZCodeAgentSessionTarget,
++    summary: SessionSummary,
++  ): void {
++    const title = summary.title.trim();
+@@ -642,8 +709,8 @@ export function createZCodeTaskIndexSyncer(
+-          // draft session 不预写占位行；首个标题（旧 first_input）先于任何
+-          // snapshot upsert 到达时按完整 snapshot 回源，避免依赖空 session 占位行。
+-          // v4 createSession 不经过 zcodeSessionService.createSession；首个标题到达且
+-          // task index 尚无行，说明这是新会话首次落库。回源时必须同时写 grouped 顶层最小
+-          // sort_order，否则缺序节点会被客户端补到列表末尾。
+-          void resyncTaskIndexRowFromAgent(target, "meta.titleUpdated", {
+-            moveGroupedTaskToTop: true,
+-          });
++          // 缺失行时持久摘要使用 insert-if-missing，活跃本地 runtime 才回源完整 snapshot。
++          if (summary.sessionEnded) {
++            void seedStoreBackedTaskMembership(state, summary, "meta.titleUpdated");
++          } else {
++            void resyncTaskIndexRowFromAgent(target, "meta.titleUpdated", {
++              moveGroupedTaskToTop: true,
++            });
++          }
+@@ -683,0 +751,3 @@ export function createZCodeTaskIndexSyncer(
++      if (next.sessionEnded) {
++        void seedStoreBackedTaskMembership(state, next, "session.terminalTransition");
++      }
+@@ -687 +757 @@ export function createZCodeTaskIndexSyncer(
+-      // v4 预热 session 从 draft 提升，或 online delta 首次出现新 session 时，
++      // v4 online delta 首次出现 session 时，为 store-backed 和本地 live runtime 选择不同回填路径。
+@@ -689,4 +759,10 @@ export function createZCodeTaskIndexSyncer(
+-      // 立即回源写入 task 行与 grouped root 最小 sort_order，避免缺序节点落到末尾。
+-      void resyncTaskIndexRowFromAgent(target, "session.became-visible", {
+-        moveGroupedTaskToTop: true,
+-      });
++      // 持久摘要走现有 TaskIndexRepo grouped 顺序；活跃本地 runtime 从完整 snapshot 收敛。
++      if (next.sessionEnded) {
++        // 持久 sessionStore 摘要没有本进程的 SessionRecord。默认 title 继续隐藏；
++        // first_input 生成标题后才从轻量摘要建立 task-index membership。
++        void seedStoreBackedTaskMembership(state, next, "session.became-visible");
++      } else {
++        void resyncTaskIndexRowFromAgent(target, "session.became-visible", {
++          moveGroupedTaskToTop: true,
++        });
++      }
+@@ -697 +773,5 @@ export function createZCodeTaskIndexSyncer(
+-      applyTitleChange(target, title);
++      applyTitleChange(state, target, next);
++    }
++    if (next.sessionEnded && next.titleSource !== "default" && title) {
++      // Retry store-only membership after a transient index write failure, even when only preview/activity changed.
++      void seedStoreBackedTaskMembership(state, next, "session.summaryUpdated");
+@@ -1645,0 +1726 @@ export function createZCodeTaskIndexSyncer(
++      storeSummaryMemberships: new Map(),
+diff --git a/packages/services/test/zcodeTaskIndexSyncerLiveMembership.test.ts b/packages/services/test/zcodeTaskIndexSyncerLiveMembership.test.ts
+new file mode 100644
+index 0000000..298a32e
+--- /dev/null
++++ b/packages/services/test/zcodeTaskIndexSyncerLiveMembership.test.ts
+@@ -0,0 +1,902 @@
++import assert from "node:assert/strict";
++import { mkdtemp, rm } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import test from "node:test";
++import { Emitter } from "@zcode/rpc";
++import { resolveWorkspaceKey, ZCODE_AGENT_PROVIDER, type ZCodeTaskMeta } from "@zcode/shared";
++import {
++  sessionsIndexTopic,
++  workspaceConfigTopic,
++  V4_WIRE_PROTOCOL_VERSION,
++  type SessionSummary,
++  type SessionsIndexTopicWireCandidate,
++  type WorkspaceConfigTopicWireCandidate,
++} from "@zcode/shared/zcode-protocol-v4";
++import { TaskIndexRepo } from "../src/session/taskIndexRepo.js";
++import { createZCodeTaskIndexSyncer } from "../src/zcode-agent/zcodeTaskIndexSyncer.js";
++import { createZCodeTaskServiceAdapter } from "../src/zcode-agent/zcodeTaskServiceAdapter.js";
++import type { IZCodeAgentService } from "../src/zcode-agent/zcodeAgent.js";
++
++const workspaceIdentityA = "synthetic-workspace-a";
++const workspaceIdentityB = "synthetic-workspace-b";
++const workspacePathA = "/synthetic/workspace-a";
++const workspacePathB = "/synthetic/workspace-b";
++const anchorAt = 1_700_000_000_000;
++
++interface IndexSubscription {
++  id: string;
++  ordinal: number;
++  seq: number;
++}
++
++function createProviderFreeAgentService() {
++  const indexEmitters = new Map<string, Emitter<SessionsIndexTopicWireCandidate>>();
++  const configEmitters = new Map<string, Emitter<WorkspaceConfigTopicWireCandidate>>();
++  const subscriptions = new Map<string, IndexSubscription>();
++  let readSessionCalls = 0;
++  let subscriptionNumber = 0;
++
++  function indexEmitter(workspaceId: string): Emitter<SessionsIndexTopicWireCandidate> {
++    let emitter = indexEmitters.get(workspaceId);
++    if (!emitter) {
++      emitter = new Emitter<SessionsIndexTopicWireCandidate>();
++      indexEmitters.set(workspaceId, emitter);
++    }
++    return emitter;
++  }
++
++  function configEmitter(workspaceId: string): Emitter<WorkspaceConfigTopicWireCandidate> {
++    let emitter = configEmitters.get(workspaceId);
++    if (!emitter) {
++      emitter = new Emitter<WorkspaceConfigTopicWireCandidate>();
++      configEmitters.set(workspaceId, emitter);
++    }
++    return emitter;
++  }
++
++  function emitSnapshot(workspaceId: string, sub: IndexSubscription): void {
++    sub.ordinal += 1;
++    indexEmitter(workspaceId).fire({
++      wireVersion: V4_WIRE_PROTOCOL_VERSION,
++      kind: "complete",
++      deliveryKind: "initial",
++      logicalFrameId: sub.id + "-frame-" + sub.ordinal,
++      logicalFrameOrdinal: sub.ordinal,
++      topic: sessionsIndexTopic(workspaceId),
++      subscriptionId: sub.id,
++      frame: {
++        topic: sessionsIndexTopic(workspaceId),
++        subscriptionId: sub.id,
++        fromSeq: 0,
++        toSeq: 0,
++        sentAt: anchorAt,
++        payload: {
++          kind: "snapshot",
++          snapshot: {
++            protocolVersion: 1,
++            workspaceId,
++            logEpoch: "epoch-" + workspaceId,
++            sessions: [
++              summary({
++                sessionId: "anchor-" + workspaceId,
++                workspaceId,
++                title: "Synthetic readiness anchor",
++                titleSource: "generated",
++                lastActivityAt: anchorAt,
++                createdAt: anchorAt,
++              }),
++            ],
++          },
++        },
++      },
++    });
++  }
++
++  function publishSummary(workspaceId: string, next: SessionSummary): void {
++    const sub = subscriptions.get(workspaceId);
++    assert.ok(sub, "no active synthetic index subscription for " + workspaceId);
++    const fromSeq = sub.seq;
++    sub.seq += 1;
++    sub.ordinal += 1;
++    indexEmitter(workspaceId).fire({
++      wireVersion: V4_WIRE_PROTOCOL_VERSION,
++      kind: "complete",
++      deliveryKind: "online",
++      logicalFrameId: sub.id + "-frame-" + sub.ordinal,
++      logicalFrameOrdinal: sub.ordinal,
++      topic: sessionsIndexTopic(workspaceId),
++      subscriptionId: sub.id,
++      frame: {
++        topic: sessionsIndexTopic(workspaceId),
++        subscriptionId: sub.id,
++        fromSeq,
++        toSeq: sub.seq,
++        sentAt: next.lastActivityAt,
++        payload: { kind: "deltas", deltas: [{ op: "session.upserted", session: next }] },
++      },
++    });
++  }
++
++  const service = {
++    onDynamicSessionsIndexFrame: (workspace: { workspacePath: string; workspaceIdentity?: string }) =>
++      indexEmitter(resolveWorkspaceKey(workspace)).event,
++    onDynamicWorkspaceConfigFrame: (workspace: {
++      workspacePath: string;
++      workspaceIdentity?: string;
++    }) => configEmitter(resolveWorkspaceKey(workspace)).event,
++    async subscribeSessionsIndexV4(params: { workspacePath: string; workspaceIdentity?: string }) {
++      const workspaceId = resolveWorkspaceKey(params);
++      const id = "index-sub-" + ++subscriptionNumber;
++      const sub: IndexSubscription = { id, ordinal: 0, seq: 0 };
++      subscriptions.set(workspaceId, sub);
++      // Initial notification is deliberately queued before the subscribe promise continuation,
++      // matching the post-response notification race handled by the production syncer.
++      queueMicrotask(() => emitSnapshot(workspaceId, sub));
++      return { ack: { subscriptionId: id, mode: "snapshot" as const, logEpoch: "epoch-" + workspaceId } };
++    },
++    async subscribeWorkspaceConfigV4(params: {
++      workspacePath: string;
++      workspaceIdentity?: string;
++    }) {
++      const workspaceId = resolveWorkspaceKey(params);
++      const id = "config-sub-" + workspaceId;
++      queueMicrotask(() => {
++        configEmitter(workspaceId).fire({
++          wireVersion: V4_WIRE_PROTOCOL_VERSION,
++          kind: "complete",
++          deliveryKind: "initial",
++          logicalFrameId: id + "-frame-1",
++          logicalFrameOrdinal: 1,
++          topic: workspaceConfigTopic(workspaceId),
++          subscriptionId: id,
++          frame: {
++            topic: workspaceConfigTopic(workspaceId),
++            subscriptionId: id,
++            fromSeq: 0,
++            toSeq: 0,
++            sentAt: anchorAt,
++            payload: {
++              kind: "snapshot",
++              snapshot: {
++                protocolVersion: 1,
++                workspaceId,
++                logEpoch: "config-epoch-" + workspaceId,
++                config: { configOptions: [], slashCommands: [] },
++              },
++            },
++          },
++        });
++      });
++      return {
++        ack: {
++          subscriptionId: id,
++          mode: "snapshot" as const,
++          logEpoch: "config-epoch-" + workspaceId,
++        },
++      };
++    },
++    async unsubscribeSessionsIndexV4() {},
++    async unsubscribeWorkspaceConfigV4() {},
++    async listSessions() {
++      return [];
++    },
++    async readSession() {
++      readSessionCalls += 1;
++      throw new Error("Session is not active in this synthetic Desktop runtime");
++    },
++    disposeAll() {
++      for (const emitter of indexEmitters.values()) emitter.dispose();
++      for (const emitter of configEmitters.values()) emitter.dispose();
++    },
++  } as unknown as IZCodeAgentService;
++
++  return {
++    service,
++    publishSummary,
++    readSessionCalls: () => readSessionCalls,
++  };
++}
++
++function summary(
++  overrides: Pick<SessionSummary, "sessionId" | "workspaceId"> & Partial<SessionSummary>,
++): SessionSummary {
++  return {
++    sessionId: overrides.sessionId,
++    workspaceId: overrides.workspaceId,
++    title: "Synthetic default",
++    titleSource: "default",
++    phase: "completedSuccess",
++    sessionEnded: true,
++    hasBackgroundWork: false,
++    lastActivityAt: anchorAt,
++    createdAt: anchorAt,
++    ...overrides,
++  };
++}
++
++function waitFor(
++  predicate: () => boolean | Promise<boolean>,
++  message: string,
++  timeoutMs = 2_000,
++): Promise<void> {
++  const deadline = Date.now() + timeoutMs;
++  return new Promise((resolve, reject) => {
++    const check = async () => {
++      if (await predicate()) {
++        resolve();
++        return;
++      }
++      if (Date.now() >= deadline) {
++        reject(new Error("Timed out waiting for " + message));
++        return;
++      }
++      setImmediate(check);
++    };
++    void check();
++  });
++}
++
++async function visibleTasks(
++  service: ReturnType<typeof createZCodeTaskServiceAdapter>,
++  workspacePath: string,
++  workspaceIdentity: string,
++) {
++  return service.listTasks({ workspacePath, workspaceIdentity });
++}
++
++test("online stored-session title transition creates one workspace task-index membership row", async () => {
++  const directory = await mkdtemp(join(tmpdir(), "zcode-live-task-membership-"));
++  const repo = new TaskIndexRepo(join(directory, "tasks.sqlite"));
++  const provider = createProviderFreeAgentService();
++  const syncer = createZCodeTaskIndexSyncer({
++    agentService: provider.service,
++    taskIndexRepo: repo,
++  });
++  const taskService = createZCodeTaskServiceAdapter({
++    zcodeAgentService: provider.service,
++    taskIndexRepo: repo,
++    taskIndexSyncer: syncer,
++  });
++  const events: string[] = [];
++  const subscription = syncer
++    .onDynamicWorkspaceEvent({ workspacePath: workspacePathA, workspaceIdentity: workspaceIdentityA })(
++      (event) => {
++        if (
++          event.type === "workspace_task_list_changed" &&
++          event.taskId === "external-plan-session"
++        ) {
++          events.push(event.reason);
++        }
++      },
++    );
++
++  try {
++    syncer.ensureWorkspaceSubscription({
++      workspacePath: workspacePathA,
++      workspaceIdentity: workspaceIdentityA,
++    });
++    syncer.ensureWorkspaceSubscription({
++      workspacePath: workspacePathB,
++      workspaceIdentity: workspaceIdentityB,
++    });
++
++    await waitFor(async () => {
++      const [rowsA, rowsB] = await Promise.all([
++        visibleTasks(taskService, workspacePathA, workspaceIdentityA),
++        visibleTasks(taskService, workspacePathB, workspaceIdentityB),
++      ]);
++      return (
++        rowsA.some((row) => row.taskId === "anchor-" + workspaceIdentityA) &&
++        rowsB.some((row) => row.taskId === "anchor-" + workspaceIdentityB)
++      );
++    }, "both workspace subscriptions to apply their initial snapshot");
++
++    provider.publishSummary(
++      workspaceIdentityA,
++      summary({
++        sessionId: "external-plan-session",
++        workspaceId: workspaceIdentityA,
++        title: "Synthetic default",
++        titleSource: "default",
++        lastActivityAt: anchorAt + 1_000,
++      }),
++    );
++    await new Promise<void>((resolve) => setImmediate(resolve));
++    assert.equal(
++      (await visibleTasks(taskService, workspacePathA, workspaceIdentityA)).some(
++        (row) => row.taskId === "external-plan-session",
++      ),
++      false,
++      "a default title must not flash as a visible task",
++    );
++
++    provider.publishSummary(
++      workspaceIdentityA,
++      summary({
++        sessionId: "external-plan-session",
++        workspaceId: workspaceIdentityA,
++        title: "Synthetic plan request",
++        titleSource: "generated",
++        lastActivityAt: anchorAt + 2_000,
++      }),
++    );
++    await waitFor(
++      async () =>
++        (await visibleTasks(taskService, workspacePathA, workspaceIdentityA)).some(
++          (row) => row.taskId === "external-plan-session",
++        ),
++      "a generated first-input title to appear in the current workspace task list",
++    );
++    const created = (await visibleTasks(taskService, workspacePathA, workspaceIdentityA)).find(
++      (row) => row.taskId === "external-plan-session",
++    );
++    assert.equal(created?.title, "Synthetic plan request");
++    assert.equal(created?.updatedAt, anchorAt + 2_000);
++    assert.deepEqual(events, ["task_created"]);
++    assert.equal(
++      (await visibleTasks(taskService, workspacePathB, workspaceIdentityB)).some(
++        (row) => row.taskId === "external-plan-session",
++      ),
++      false,
++      "the new task must remain isolated to its own workspace identity",
++    );
++
++    provider.publishSummary(
++      workspaceIdentityA,
++      summary({
++        sessionId: "external-plan-session",
++        workspaceId: workspaceIdentityA,
++        title: "Synthetic plan request",
++        titleSource: "generated",
++        lastActivityAt: anchorAt + 3_000,
++        lastAssistantPreview: "Synthetic DSP reply",
++      }),
++    );
++    await new Promise<void>((resolve) => setImmediate(resolve));
++    assert.deepEqual(events, ["task_created"], "reply metadata must not duplicate membership events");
++    assert.equal(provider.readSessionCalls(), 0, "stored-only summaries must not resume/read another runtime");
++  } finally {
++    subscription.dispose();
++    taskService.disposeAll();
++    await rm(directory, { recursive: true, force: true });
++  }
++});
++
++test("live stored summary seeding leaves an existing local task row authoritative", async () => {
++  const directory = await mkdtemp(join(tmpdir(), "zcode-live-task-preserve-"));
++  const repo = new TaskIndexRepo(join(directory, "tasks.sqlite"));
++  const provider = createProviderFreeAgentService();
++  const localMeta: ZCodeTaskMeta = {
++    taskId: "local-live-session",
++    traceId: "trace-local-live-session",
++    title: "User's local title",
++    titleOverridden: true,
++    workspacePath: workspacePathA,
++    workspaceIdentity: workspaceIdentityA,
++    createdAt: anchorAt,
++    updatedAt: anchorAt + 50,
++    mode: "plan",
++    provider: ZCODE_AGENT_PROVIDER,
++    model: "synthetic-local-model",
++    unreadAt: anchorAt + 25,
++    status: "running",
++  };
++  await repo.syncTaskMeta({ meta: localMeta, titleOverridden: true });
++  const syncer = createZCodeTaskIndexSyncer({
++    agentService: provider.service,
++    taskIndexRepo: repo,
++  });
++  const taskService = createZCodeTaskServiceAdapter({
++    zcodeAgentService: provider.service,
++    taskIndexRepo: repo,
++    taskIndexSyncer: syncer,
++  });
++
++  try {
++    syncer.ensureWorkspaceSubscription({
++      workspacePath: workspacePathA,
++      workspaceIdentity: workspaceIdentityA,
++    });
++    await waitFor(
++      async () =>
++        (await visibleTasks(taskService, workspacePathA, workspaceIdentityA)).some(
++          (row) => row.taskId === "anchor-" + workspaceIdentityA,
++        ),
++      "the current workspace task-index subscription to become ready",
++    );
++
++    provider.publishSummary(
++      workspaceIdentityA,
++      summary({
++        sessionId: localMeta.taskId,
++        workspaceId: workspaceIdentityA,
++        title: "Remote generated title",
++        titleSource: "generated",
++        lastActivityAt: anchorAt + 10_000,
++      }),
++    );
++    await new Promise<void>((resolve) => setImmediate(resolve));
++
++    const persisted = await repo.getTaskMeta({
++      workspacePath: workspacePathA,
++      workspaceIdentity: workspaceIdentityA,
++      taskId: localMeta.taskId,
++    });
++    assert.ok(persisted);
++    assert.equal(persisted.title, "User's local title");
++    assert.equal(persisted.titleOverridden, true);
++    assert.equal(persisted.status, "running");
++    assert.equal(persisted.mode, "plan");
++    assert.equal(persisted.model, "synthetic-local-model");
++    assert.equal(persisted.unreadAt, anchorAt + 25);
++    assert.equal(persisted.updatedAt, anchorAt + 50);
++  } finally {
++    taskService.disposeAll();
++    await rm(directory, { recursive: true, force: true });
++  }
++});
++
++test("grouped admission preserves local edits committed after store-summary insert", async () => {
++  const directory = await mkdtemp(join(tmpdir(), "zcode-live-task-admission-race-"));
++  const repo = new TaskIndexRepo(join(directory, "tasks.sqlite"));
++  const targetTaskId = "external-admission-race-session";
++  const initializeGroupedTaskAtTop = repo.initializeGroupedTaskAtTop.bind(repo);
++  let localEditInjected = false;
++  let admissionAttempts = 0;
++  repo.initializeGroupedTaskAtTop = async (params) => {
++    admissionAttempts += 1;
++    if (params.taskId === targetTaskId && !localEditInjected) {
++      localEditInjected = true;
++      const inserted = await repo.getTaskMeta(params);
++      assert.ok(inserted, "store summary must insert before grouped admission");
++      await repo.updateTaskState({
++        ...params,
++        patch: {
++          title: "User edited during membership admission",
++          titleOverridden: true,
++          status: "running",
++          model: "synthetic-local-model-after-seed",
++          unreadAt: anchorAt + 50,
++          updatedAt: anchorAt + 100,
++          pinned: true,
++        },
++      });
++      const locallyEdited = await repo.getTaskMeta(params);
++      assert.ok(locallyEdited);
++      await repo.syncTaskMeta({
++        meta: { ...locallyEdited, mode: "plan" },
++        pinned: true,
++        titleOverridden: true,
++      });
++    }
++    return initializeGroupedTaskAtTop(params);
++  };
++  const provider = createProviderFreeAgentService();
++  const syncer = createZCodeTaskIndexSyncer({
++    agentService: provider.service,
++    taskIndexRepo: repo,
++  });
++  const taskService = createZCodeTaskServiceAdapter({
++    zcodeAgentService: provider.service,
++    taskIndexRepo: repo,
++    taskIndexSyncer: syncer,
++  });
++  const events: string[] = [];
++  const subscription = syncer
++    .onDynamicWorkspaceEvent({ workspacePath: workspacePathA, workspaceIdentity: workspaceIdentityA })(
++      (event) => {
++        if (
++          event.type === "workspace_task_list_changed" &&
++          event.taskId === targetTaskId
++        ) {
++          events.push(event.reason);
++        }
++      },
++    );
++
++  try {
++    syncer.ensureWorkspaceSubscription({
++      workspacePath: workspacePathA,
++      workspaceIdentity: workspaceIdentityA,
++    });
++    await waitFor(
++      async () =>
++        (await visibleTasks(taskService, workspacePathA, workspaceIdentityA)).some(
++          (row) => row.taskId === "anchor-" + workspaceIdentityA,
++        ),
++      "the current workspace task-index subscription to become ready",
++    );
++
++    provider.publishSummary(
++      workspaceIdentityA,
++      summary({
++        sessionId: targetTaskId,
++        workspaceId: workspaceIdentityA,
++        title: "Synthetic generated title",
++        titleSource: "generated",
++        lastActivityAt: anchorAt + 10_000,
++      }),
++    );
++    await waitFor(() => localEditInjected, "the injected local edit before grouped admission");
++    await waitFor(
++      async () =>
++        (await repo.getTaskMeta({
++          workspacePath: workspacePathA,
++          workspaceIdentity: workspaceIdentityA,
++          taskId: targetTaskId,
++          }))?.title === "User edited during membership admission" &&
++          (await repo.getTaskMeta({
++            workspacePath: workspacePathA,
++            workspaceIdentity: workspaceIdentityA,
++            taskId: targetTaskId,
++          }))?.mode === "plan",
++      "the injected local edit to commit after store-summary seeding",
++    );
++    await waitFor(() => events.length === 1, "one membership event after grouped admission");
++
++    const persisted = await repo.getTaskMeta({
++      workspacePath: workspacePathA,
++      workspaceIdentity: workspaceIdentityA,
++      taskId: targetTaskId,
++    });
++    assert.ok(persisted);
++    assert.equal(persisted.title, "User edited during membership admission");
++    assert.equal(persisted.titleOverridden, true);
++    assert.equal(persisted.status, "running");
++    assert.equal(persisted.mode, "plan");
++    assert.equal(persisted.model, "synthetic-local-model-after-seed");
++    assert.equal(persisted.unreadAt, anchorAt + 50);
++    assert.equal(persisted.updatedAt, anchorAt + 100);
++    assert.equal(
++      (await repo.listTaskMetas({
++        workspacePath: workspacePathA,
++        workspaceIdentity: workspaceIdentityA,
++        pinned: true,
++      })).some((row) => row.taskId === targetTaskId),
++      true,
++      "the row stays in the task-index left table with its local pin state",
++    );
++    assert.equal(admissionAttempts, 1);
++    assert.deepEqual(events, ["task_created"]);
++    assert.equal(provider.readSessionCalls(), 0);
++  } finally {
++    subscription.dispose();
++    taskService.disposeAll();
++    await rm(directory, { recursive: true, force: true });
++  }
++});
++
++test("grouped admission does not revive a store-backed row deleted after insert", async () => {
++  const directory = await mkdtemp(join(tmpdir(), "zcode-live-task-tombstone-race-"));
++  const repo = new TaskIndexRepo(join(directory, "tasks.sqlite"));
++  const targetTaskId = "external-tombstone-race-session";
++  const initializeGroupedTaskAtTop = repo.initializeGroupedTaskAtTop.bind(repo);
++  let tombstoneInjected = false;
++  repo.initializeGroupedTaskAtTop = async (params) => {
++    if (params.taskId === targetTaskId && !tombstoneInjected) {
++      tombstoneInjected = true;
++      const inserted = await repo.getTaskMeta(params);
++      assert.ok(inserted, "store summary must insert before tombstoning");
++      await repo.syncTaskMeta({ meta: inserted, archived: true });
++      assert.ok(
++        await repo.deleteArchivedTask({
++          workspacePath: workspacePathA,
++          workspaceIdentity: workspaceIdentityA,
++          taskId: targetTaskId,
++        }),
++        "the injected user deletion must persist a tombstone",
++      );
++    }
++    return initializeGroupedTaskAtTop(params);
++  };
++  const provider = createProviderFreeAgentService();
++  const syncer = createZCodeTaskIndexSyncer({
++    agentService: provider.service,
++    taskIndexRepo: repo,
++  });
++  const taskService = createZCodeTaskServiceAdapter({
++    zcodeAgentService: provider.service,
++    taskIndexRepo: repo,
++    taskIndexSyncer: syncer,
++  });
++  const events: string[] = [];
++  const subscription = syncer
++    .onDynamicWorkspaceEvent({ workspacePath: workspacePathA, workspaceIdentity: workspaceIdentityA })(
++      (event) => {
++        if (
++          event.type === "workspace_task_list_changed" &&
++          event.taskId === targetTaskId
++        ) {
++          events.push(event.reason);
++        }
++      },
++    );
++
++  try {
++    syncer.ensureWorkspaceSubscription({
++      workspacePath: workspacePathA,
++      workspaceIdentity: workspaceIdentityA,
++    });
++    await waitFor(
++      async () =>
++        (await visibleTasks(taskService, workspacePathA, workspaceIdentityA)).some(
++          (row) => row.taskId === "anchor-" + workspaceIdentityA,
++        ),
++      "the current workspace task-index subscription to become ready",
++    );
++
++    provider.publishSummary(
++      workspaceIdentityA,
++      summary({
++        sessionId: targetTaskId,
++        workspaceId: workspaceIdentityA,
++        title: "Synthetic generated title",
++        titleSource: "generated",
++        lastActivityAt: anchorAt + 20_000,
++      }),
++    );
++    await waitFor(
++      async () =>
++        tombstoneInjected &&
++        (await repo.listDeletedTaskIds({
++          workspacePath: workspacePathA,
++          workspaceIdentity: workspaceIdentityA,
++        })).includes(targetTaskId),
++      "the injected delete to commit before grouped admission",
++    );
++    await new Promise<void>((resolve) => setImmediate(resolve));
++
++    assert.deepEqual(await repo.listDeletedTaskIds({
++      workspacePath: workspacePathA,
++      workspaceIdentity: workspaceIdentityA,
++    }), [targetTaskId]);
++    assert.equal(
++      (await visibleTasks(taskService, workspacePathA, workspaceIdentityA)).some(
++        (row) => row.taskId === targetTaskId,
++      ),
++      false,
++    );
++    assert.deepEqual(events, [], "a tombstoned row must not broadcast as a new membership");
++
++    provider.publishSummary(
++      workspaceIdentityA,
++      summary({
++        sessionId: targetTaskId,
++        workspaceId: workspaceIdentityA,
++        title: "Synthetic generated title",
++        titleSource: "generated",
++        lastActivityAt: anchorAt + 21_000,
++        lastAssistantPreview: "Synthetic reply after deletion",
++      }),
++    );
++    await new Promise<void>((resolve) => setImmediate(resolve));
++    assert.deepEqual(await repo.listDeletedTaskIds({
++      workspacePath: workspacePathA,
++      workspaceIdentity: workspaceIdentityA,
++    }), [targetTaskId]);
++    assert.deepEqual(events, []);
++  } finally {
++    subscription.dispose();
++    taskService.disposeAll();
++    await rm(directory, { recursive: true, force: true });
++  }
++});
++
++test("a later same-title stored summary retries transient membership failure exactly once", async () => {
++  const directory = await mkdtemp(join(tmpdir(), "zcode-live-task-retry-"));
++  const repo = new TaskIndexRepo(join(directory, "tasks.sqlite"));
++  const originalSeed = repo.seedTaskMetaIfMissing.bind(repo);
++  let seedAttempts = 0;
++  repo.seedTaskMetaIfMissing = async (meta) => {
++    if (meta.taskId === "external-retry-session") {
++      seedAttempts += 1;
++      if (seedAttempts === 1) throw new Error("synthetic transient task-index write failure");
++    }
++    return originalSeed(meta);
++  };
++  const provider = createProviderFreeAgentService();
++  const syncer = createZCodeTaskIndexSyncer({
++    agentService: provider.service,
++    taskIndexRepo: repo,
++  });
++  const taskService = createZCodeTaskServiceAdapter({
++    zcodeAgentService: provider.service,
++    taskIndexRepo: repo,
++    taskIndexSyncer: syncer,
++  });
++  const events: string[] = [];
++  const subscription = syncer
++    .onDynamicWorkspaceEvent({ workspacePath: workspacePathA, workspaceIdentity: workspaceIdentityA })(
++      (event) => {
++        if (
++          event.type === "workspace_task_list_changed" &&
++          event.taskId === "external-retry-session"
++        ) {
++          events.push(event.reason);
++        }
++      },
++    );
++
++  try {
++    syncer.ensureWorkspaceSubscription({
++      workspacePath: workspacePathA,
++      workspaceIdentity: workspaceIdentityA,
++    });
++    await waitFor(
++      async () =>
++        (await visibleTasks(taskService, workspacePathA, workspaceIdentityA)).some(
++          (row) => row.taskId === "anchor-" + workspaceIdentityA,
++        ),
++      "the current workspace task-index subscription to become ready",
++    );
++
++    provider.publishSummary(
++      workspaceIdentityA,
++      summary({
++        sessionId: "external-retry-session",
++        workspaceId: workspaceIdentityA,
++        title: "Synthetic retry request",
++        titleSource: "generated",
++        lastActivityAt: anchorAt + 20_000,
++      }),
++    );
++    await waitFor(() => seedAttempts === 1, "the injected first seed attempt");
++    await new Promise<void>((resolve) => setImmediate(resolve));
++    assert.equal(
++      (await visibleTasks(taskService, workspacePathA, workspaceIdentityA)).some(
++        (row) => row.taskId === "external-retry-session",
++      ),
++      false,
++    );
++
++    provider.publishSummary(
++      workspaceIdentityA,
++      summary({
++        sessionId: "external-retry-session",
++        workspaceId: workspaceIdentityA,
++        title: "Synthetic retry request",
++        titleSource: "generated",
++        lastActivityAt: anchorAt + 21_000,
++        lastAssistantPreview: "Synthetic reply after retry",
++      }),
++    );
++    await waitFor(
++      async () =>
++        (await visibleTasks(taskService, workspacePathA, workspaceIdentityA)).some(
++          (row) => row.taskId === "external-retry-session",
++        ),
++      "a same-title activity update to retry and expose the task",
++    );
++
++    const visible = (await visibleTasks(taskService, workspacePathA, workspaceIdentityA)).find(
++      (row) => row.taskId === "external-retry-session",
++    );
++    assert.equal(visible?.title, "Synthetic retry request");
++    assert.equal(visible?.updatedAt, anchorAt + 21_000);
++    assert.equal(seedAttempts, 2);
++    assert.deepEqual(events, ["task_created"]);
++
++    provider.publishSummary(
++      workspaceIdentityA,
++      summary({
++        sessionId: "external-retry-session",
++        workspaceId: workspaceIdentityA,
++        title: "Synthetic retry request",
++        titleSource: "generated",
++        lastActivityAt: anchorAt + 22_000,
++        lastAssistantPreview: "Another synthetic preview",
++      }),
++    );
++    await new Promise<void>((resolve) => setImmediate(resolve));
++    assert.equal(seedAttempts, 2);
++    assert.deepEqual(events, ["task_created"]);
++  } finally {
++    subscription.dispose();
++    taskService.disposeAll();
++    await rm(directory, { recursive: true, force: true });
++  }
++});
++
++
++for (const failure of ["group", "post-read", "post-read-and-retry-read"] as const) {
++  test("post-seed " + failure + " failure resumes admission without losing the pending row", async () => {
++    const directory = await mkdtemp(join(tmpdir(), "zcode-live-post-seed-"));
++    const repo = new TaskIndexRepo(join(directory, "tasks.sqlite"));
++    const taskId = "post-seed-" + failure;
++    const getMeta = repo.getTaskMeta.bind(repo);
++    const group = repo.initializeGroupedTaskAtTop.bind(repo);
++    const seed = repo.seedTaskMetaIfMissing.bind(repo);
++    let seeds = 0;
++    let groups = 0;
++    let failedReads = 0;
++    let readFailurePending = false;
++    repo.seedTaskMetaIfMissing = async (meta) => {
++      const result = await seed(meta);
++      if (meta.taskId === taskId) seeds += 1;
++      return result;
++    };
++    repo.initializeGroupedTaskAtTop = async (params) => {
++      if (params.taskId === taskId) {
++        groups += 1;
++        if (groups === 1 && failure === "group") throw new Error("injected post-seed group failure");
++        if (groups === 1 && failure !== "group") readFailurePending = true;
++      }
++      return group(params);
++    };
++    repo.getTaskMeta = async (params) => {
++      if (params.taskId === taskId && (readFailurePending || (failure === "post-read-and-retry-read" && failedReads === 1))) {
++        readFailurePending = false;
++        failedReads += 1;
++        throw new Error("injected pending membership read failure");
++      }
++      return getMeta(params);
++    };
++    const provider = createProviderFreeAgentService();
++    const syncer = createZCodeTaskIndexSyncer({ agentService: provider.service, taskIndexRepo: repo });
++    const service = createZCodeTaskServiceAdapter({ zcodeAgentService: provider.service, taskIndexRepo: repo, taskIndexSyncer: syncer });
++    const events: string[] = [];
++    const subscription = syncer.onDynamicWorkspaceEvent({ workspacePath: workspacePathA, workspaceIdentity: workspaceIdentityA })((event) => {
++      if (event.type === "workspace_task_list_changed" && event.taskId === taskId) events.push(event.reason);
++    });
++    const publish = (at: number) => provider.publishSummary(workspaceIdentityA, summary({ sessionId: taskId, workspaceId: workspaceIdentityA, title: "Pending title", titleSource: "generated", lastActivityAt: at }));
++    try {
++      syncer.ensureWorkspaceSubscription({ workspacePath: workspacePathA, workspaceIdentity: workspaceIdentityA });
++      await waitFor(async () => (await visibleTasks(service, workspacePathA, workspaceIdentityA)).some((row) => row.taskId.startsWith("anchor-")), "initial seed");
++      publish(anchorAt + 1000);
++      await waitFor(() => failure === "group" ? groups === 1 : failedReads === 1, "injected post-seed failure");
++      await new Promise<void>((resolve) => setImmediate(resolve));
++      assert.equal(seeds, 1);
++      assert.deepEqual(events, []);
++      if (failure === "post-read-and-retry-read") {
++        publish(anchorAt + 2000);
++        await waitFor(() => failedReads === 2, "second pending read failure");
++        await new Promise<void>((resolve) => setImmediate(resolve));
++        assert.deepEqual(events, []);
++      }
++      publish(anchorAt + 3000);
++      await waitFor(() => events.length === 1, "pending row admission");
++      assert.equal(seeds, 1, "successful insert must not repeat after a post-seed failure");
++      assert.deepEqual(events, ["task_created"]);
++      assert.ok((await visibleTasks(service, workspacePathA, workspaceIdentityA)).some((row) => row.taskId === taskId));
++      publish(anchorAt + 4000);
++      await new Promise<void>((resolve) => setImmediate(resolve));
++      assert.equal(seeds, 1);
++      assert.deepEqual(events, ["task_created"]);
++      assert.equal(provider.readSessionCalls(), 0);
++    } finally {
++      subscription.dispose();
++      service.disposeAll();
++      await rm(directory, { recursive: true, force: true });
++    }
++  });
++}
++
++test("first store title arriving with terminal transition establishes membership", async () => {
++  const directory = await mkdtemp(join(tmpdir(), "zcode-live-terminal-title-"));
++  const repo = new TaskIndexRepo(join(directory, "tasks.sqlite"));
++  const provider = createProviderFreeAgentService();
++  const syncer = createZCodeTaskIndexSyncer({ agentService: provider.service, taskIndexRepo: repo });
++  const service = createZCodeTaskServiceAdapter({ zcodeAgentService: provider.service, taskIndexRepo: repo, taskIndexSyncer: syncer });
++  const taskId = "terminal-first-title";
++  const events: string[] = [];
++  const subscription = syncer.onDynamicWorkspaceEvent({ workspacePath: workspacePathA, workspaceIdentity: workspaceIdentityA })((event) => {
++    if (event.type === "workspace_task_list_changed" && event.taskId === taskId) events.push(event.reason);
++  });
++  try {
++    syncer.ensureWorkspaceSubscription({ workspacePath: workspacePathA, workspaceIdentity: workspaceIdentityA });
++    await waitFor(async () => (await visibleTasks(service, workspacePathA, workspaceIdentityA)).some((row) => row.taskId.startsWith("anchor-")), "initial seed");
++    provider.publishSummary(workspaceIdentityA, summary({ sessionId: taskId, workspaceId: workspaceIdentityA, phase: "running" }));
++    await new Promise<void>((resolve) => setImmediate(resolve));
++    provider.publishSummary(workspaceIdentityA, summary({ sessionId: taskId, workspaceId: workspaceIdentityA, title: "First title at completion", titleSource: "generated", phase: "completedSuccess", lastActivityAt: anchorAt + 1000 }));
++    await waitFor(() => events.includes("task_created"), "terminal membership");
++    const meta = await repo.getTaskMeta({ workspacePath: workspacePathA, workspaceIdentity: workspaceIdentityA, taskId });
++    assert.equal(meta?.title, "First title at completion");
++    assert.equal(meta?.status, "completed");
++    assert.equal(events.filter((reason) => reason === "task_created").length, 1);
++  } finally {
++    subscription.dispose();
++    service.disposeAll();
++    await rm(directory, { recursive: true, force: true });
++  }
++});
